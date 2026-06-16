@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="FK">
+  <defs>
+    <linearGradient id="bg" x1="8" y1="8" x2="56" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0f2f2f"/>
+      <stop offset="1" stop-color="#061313"/>
+    </linearGradient>
+    <linearGradient id="stroke" x1="10" y1="6" x2="54" y2="58" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2dd4bf"/>
+      <stop offset="1" stop-color="#0f766e"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="url(#bg)"/>
+  <rect x="5" y="5" width="54" height="54" rx="12" fill="none" stroke="url(#stroke)" stroke-width="3"/>
+  <text
+    x="32"
+    y="39"
+    fill="#2dd4bf"
+    font-family="Inter, Arial, Helvetica, sans-serif"
+    font-size="23"
+    font-weight="800"
+    letter-spacing="1"
+    text-anchor="middle"
+  >FK</text>
+</svg>
