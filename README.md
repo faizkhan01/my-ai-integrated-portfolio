@@ -5,10 +5,10 @@ Professional AI-integrated portfolio website for Md. Faizur Rahman Khan, a senio
 ## Features
 
 - Responsive single-page portfolio with animated hero, experience, skills, AI chat, contact, and resume download.
-- Recruiter-focused AI chat powered by Groq.
+- Recruiter-focused AI chat powered by Groq, with OpenRouter fallback.
 - Streaming chat responses with automatic retry for temporary provider errors.
 - CV-aware answers from verified profile context embedded in `server.mjs`.
-- Web-search mode for current-world questions using Groq Compound.
+- Web-search mode for current-world questions using Groq Compound, with OpenRouter web fallback.
 - FIFA World Cup 2026 match-update fallback using ESPN's public scoreboard endpoint to avoid invented sports results.
 - Downloadable resume from `public/assets/md-faizur-rahman-khan-resume.pdf`.
 - Static assets served from `public/`, with the Node server handling `/api/chat`.
@@ -19,6 +19,7 @@ Professional AI-integrated portfolio website for Md. Faizur Rahman Khan, a senio
 - Vanilla HTML, CSS, and JavaScript
 - Groq chat completions API
 - Groq Compound web-search model
+- OpenRouter chat completions API fallback
 - ESPN public scoreboard API for FIFA World Cup updates
 
 ## Project Structure
@@ -49,6 +50,12 @@ Required:
 GROK_API_KEY=replace-with-your-groq-api-key
 ```
 
+Optional fallback:
+
+```env
+OPENROUTER_API_KEY=replace-with-your-openrouter-api-key
+```
+
 Optional:
 
 ```env
@@ -56,6 +63,12 @@ GROK_CHAT_MODEL=llama-3.1-8b-instant
 GROK_WEB_SEARCH_MODEL=groq/compound-mini
 GROK_CHAT_COMPLETIONS_URL=https://api.groq.com/openai/v1/chat/completions
 GROK_MAX_TOKENS=550
+OPENROUTER_CHAT_MODEL=openrouter/auto
+OPENROUTER_WEB_SEARCH_MODEL=openrouter/auto
+OPENROUTER_CHAT_COMPLETIONS_URL=https://openrouter.ai/api/v1/chat/completions
+OPENROUTER_MAX_TOKENS=500
+OPENROUTER_SITE_URL=https://faizurrahman-portfolio.web.app
+OPENROUTER_APP_NAME=Md. Faizur Rahman Khan Portfolio
 PORT=4173
 ```
 
@@ -93,6 +106,8 @@ For Faizur/profile questions, the assistant answers from verified portfolio and 
 
 For current-world questions, the assistant switches to Groq web search and includes verified source links when available.
 
+If Groq is unavailable or rate-limited, the server falls back to OpenRouter. Current-world fallback uses OpenRouter's web plugin with a small result limit to keep token usage controlled.
+
 For FIFA World Cup 2026 match-update questions, the server uses ESPN scoreboard data directly instead of relying on LLM-generated sports summaries.
 
 ## Deployment
@@ -117,6 +132,7 @@ Add the same environment variables in the Render dashboard, especially:
 
 ```env
 GROK_API_KEY=your-production-groq-key
+OPENROUTER_API_KEY=your-production-openrouter-key
 ```
 
 Render provides `PORT` automatically, and `server.mjs` already reads it.

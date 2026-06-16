@@ -21,6 +21,15 @@ const groqChatCompletionsUrl =
   'https://api.groq.com/openai/v1/chat/completions';
 const groqMaxTokens =
   Number.parseInt(process.env.GROQ_MAX_TOKENS || process.env.GROK_MAX_TOKENS || '550', 10) || 550;
+const openRouterApiKey = process.env.OPENROUTER_API_KEY || '';
+const openRouterModel = process.env.OPENROUTER_CHAT_MODEL || 'openrouter/auto';
+const openRouterWebSearchModel = process.env.OPENROUTER_WEB_SEARCH_MODEL || openRouterModel;
+const openRouterChatCompletionsUrl =
+  process.env.OPENROUTER_CHAT_COMPLETIONS_URL || 'https://openrouter.ai/api/v1/chat/completions';
+const openRouterMaxTokens =
+  Number.parseInt(process.env.OPENROUTER_MAX_TOKENS || '500', 10) || 500;
+const openRouterSiteUrl = process.env.OPENROUTER_SITE_URL || 'https://faizurrahman-portfolio.web.app';
+const openRouterAppName = process.env.OPENROUTER_APP_NAME || 'Md. Faizur Rahman Khan Portfolio';
 const resumeDownloadPath = '/assets/md-faizur-rahman-khan-resume.pdf';
 const currentDateLabel = getCurrentDateLabel();
 const currentDateIso = getCurrentDateIso();
@@ -161,9 +170,9 @@ async function handleChat(request, response) {
     return;
   }
 
-  if (!groqApiKey) {
+  if (!groqApiKey && !openRouterApiKey) {
     sendJson(response, 503, {
-      error: 'Portfolio chat is not configured. Set GROK_API_KEY or GROQ_API_KEY on the server.',
+      error: 'Portfolio chat is not configured. Set GROK_API_KEY/GROQ_API_KEY or OPENROUTER_API_KEY on the server.',
     });
     return;
   }
@@ -195,9 +204,8 @@ async function handleChat(request, response) {
     });
   } catch (error) {
     console.error('[portfolio-chat]', error.message);
-    sendJson(response, 503, {
-      error: 'The portfolio chat is temporarily unavailable. Please try again in a moment.',
-    });
+    const payload = buildChatErrorPayload(error);
+    sendJson(response, payload.status, payload.body);
   }
 }
 
@@ -210,52 +218,81 @@ async function streamDynamicPortfolioAnswer(messages, response, groqRequestOptio
   });
 
   try {
-    if (groqRequestOptions.provider === 'groq-web-search') {
-      const result = await generateDynamicPortfolioAnswer(messages, groqRequestOptions);
-      writeJsonLine(response, {
-        type: 'chunk',
-        delta: cleanDynamicAnswer(result.answer),
+    let hasContent = false;
+    let streamProvider = groqRequestOptions.provider;
+    try {
+      if (!groqApiKey) throw new Error('Groq is not configured');
+
+      await retryGroqRequest(
+        async () => {
+          hasContent = false;
+          await streamGroq(messages, groqRequestOptions, (delta) => {
+            if (!delta) return;
+            hasContent = true;
+            writeJsonLine(response, {
+              type: 'chunk',
+              delta,
+            });
+          });
+        },
+        {
+          shouldRetry: (error) => !hasContent && isRetryableGroqError(error),
+        },
+      );
+
+      if (!hasContent) throw new Error('Groq returned an empty stream');
+    } catch (error) {
+      if (hasContent || !openRouterApiKey) throw error;
+      console.error('[groq-stream-fallback]', error.message);
+      await streamOpenRouter(messages, groqRequestOptions, (delta) => {
+        if (!delta) return;
+        hasContent = true;
+        writeJsonLine(response, {
+          type: 'chunk',
+          delta,
+        });
       });
-      writeJsonLine(response, {
-        type: 'done',
-        provider: result.provider,
-      });
-      return;
+      streamProvider =
+        groqRequestOptions.provider === 'groq-web-search'
+          ? 'openrouter-web-search'
+          : 'openrouter';
     }
 
-    let hasContent = false;
-    await retryGroqRequest(
-      async () => {
-        hasContent = false;
-        await streamGroq(messages, groqRequestOptions, (delta) => {
-          if (!delta) return;
-          hasContent = true;
-          writeJsonLine(response, {
-            type: 'chunk',
-            delta,
-          });
-        });
-      },
-      {
-        shouldRetry: (error) => !hasContent && isRetryableGroqError(error),
-      },
-    );
-
-    if (!hasContent) throw new Error('Groq returned an empty stream');
+    if (!hasContent) throw new Error('AI provider returned an empty stream');
 
     writeJsonLine(response, {
       type: 'done',
-      provider: groqRequestOptions.provider,
+      provider: streamProvider,
     });
   } catch (error) {
     console.error('[portfolio-chat-stream]', error.message);
     writeJsonLine(response, {
       type: 'error',
-      error: 'The portfolio chat is temporarily unavailable. Please try again in a moment.',
+      ...buildChatErrorPayload(error).body,
     });
   } finally {
     response.end();
   }
+}
+
+function buildChatErrorPayload(error) {
+  if (error?.code === 'rate_limit_exceeded') {
+    return {
+      status: 429,
+      body: {
+        error: 'The AI daily token limit has been reached. Please try again after the quota resets.',
+        retryable: false,
+      },
+    };
+  }
+
+  return {
+    status: 503,
+    body: {
+      error: 'The portfolio chat is temporarily unavailable. Please try again in a moment.',
+      retryable: true,
+    },
+  };
 }
 
 function sendStreamedStaticAnswer(response, answer, provider) {
@@ -277,28 +314,57 @@ function sendStreamedStaticAnswer(response, answer, provider) {
 }
 
 async function generateDynamicPortfolioAnswer(messages, groqRequestOptions) {
-  const groqResult = await retryGroqRequest(() => callGroq(messages, groqRequestOptions));
+  const aiResult = await generateAiAnswerWithFallback(messages, groqRequestOptions);
 
-  if (groqRequestOptions.provider === 'groq-web-search' && !groqResult.sources.length) {
+  if (groqRequestOptions.provider === 'groq-web-search' && !aiResult.sources.length) {
     return {
       answer: buildUnverifiedCurrentInfoAnswer(groqRequestOptions),
-      provider: groqRequestOptions.provider,
+      provider: aiResult.provider,
     };
   }
 
   const answer =
     groqRequestOptions.provider === 'groq-web-search'
-      ? appendVerifiedWebSources(groqResult.answer, groqResult.sources)
-      : groqResult.answer;
+      ? appendVerifiedWebSources(aiResult.answer, aiResult.sources)
+      : aiResult.answer;
 
   if (answer) {
     return {
       answer,
-      provider: groqRequestOptions.provider,
+      provider: aiResult.provider,
     };
   }
 
-  throw new Error('Groq returned an empty response');
+  throw new Error('AI provider returned an empty response');
+}
+
+async function generateAiAnswerWithFallback(messages, groqRequestOptions) {
+  const errors = [];
+
+  if (groqApiKey) {
+    try {
+      const result = await retryGroqRequest(() => callGroq(messages, groqRequestOptions));
+      return {
+        ...result,
+        provider: groqRequestOptions.provider,
+      };
+    } catch (error) {
+      errors.push(`Groq: ${error.message}`);
+      console.error('[groq-fallback]', error.message);
+    }
+  }
+
+  if (openRouterApiKey) {
+    try {
+      return await callOpenRouter(messages, groqRequestOptions);
+    } catch (error) {
+      errors.push(`OpenRouter: ${error.message}`);
+      console.error('[openrouter]', error.message);
+      throw error;
+    }
+  }
+
+  throw new Error(`All configured AI providers failed. ${errors.join(' | ')}`);
 }
 
 async function callGroq(messages, groqRequestOptions) {
@@ -321,6 +387,7 @@ async function callGroq(messages, groqRequestOptions) {
     const errorBody = await aiResponse.text();
     const error = new Error(`HTTP ${aiResponse.status}: ${errorBody.slice(0, 500)}`);
     error.status = aiResponse.status;
+    setGroqErrorDetails(error, errorBody);
     throw error;
   }
 
@@ -328,6 +395,52 @@ async function callGroq(messages, groqRequestOptions) {
   return {
     answer: extractChatCompletionText(data),
     sources: extractGroqToolSources(data),
+  };
+}
+
+async function callOpenRouter(messages, groqRequestOptions) {
+  const usesWebSearch = groqRequestOptions.provider === 'groq-web-search';
+  const aiResponse = await fetchWithTimeout(openRouterChatCompletionsUrl, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${openRouterApiKey}`,
+      'Content-Type': 'application/json',
+      'HTTP-Referer': openRouterSiteUrl,
+      'X-Title': openRouterAppName,
+    },
+    body: JSON.stringify({
+      model: usesWebSearch ? openRouterWebSearchModel : openRouterModel,
+      messages,
+      temperature: usesWebSearch ? 0 : 0.2,
+      max_tokens: usesWebSearch ? Math.min(groqRequestOptions.maxTokens, 360) : openRouterMaxTokens,
+      stream: false,
+      ...(usesWebSearch
+        ? {
+            plugins: [
+              {
+                id: 'web',
+                max_results: 1,
+                search_prompt: 'Relevant current web result:',
+              },
+            ],
+          }
+        : {}),
+    }),
+  }, groqRequestOptions.timeoutMs);
+
+  if (!aiResponse.ok) {
+    const errorBody = await aiResponse.text();
+    const error = new Error(`HTTP ${aiResponse.status}: ${errorBody.slice(0, 500)}`);
+    error.status = aiResponse.status;
+    setProviderErrorDetails(error, errorBody);
+    throw error;
+  }
+
+  const data = await aiResponse.json();
+  return {
+    answer: extractChatCompletionText(data),
+    sources: extractOpenRouterSources(data),
+    provider: usesWebSearch ? 'openrouter-web-search' : 'openrouter',
   };
 }
 
@@ -351,10 +464,71 @@ async function streamGroq(messages, groqRequestOptions, onDelta) {
     const errorBody = await aiResponse.text();
     const error = new Error(`HTTP ${aiResponse.status}: ${errorBody.slice(0, 500)}`);
     error.status = aiResponse.status;
+    setGroqErrorDetails(error, errorBody);
     throw error;
   }
 
   if (!aiResponse.body) throw new Error('Groq did not return a response stream');
+
+  const reader = aiResponse.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split(/\n\n/);
+    buffer = events.pop() || '';
+
+    for (const event of events) {
+      if (processGroqStreamEvent(event, onDelta)) return;
+    }
+  }
+
+  if (buffer) processGroqStreamEvent(buffer, onDelta);
+}
+
+async function streamOpenRouter(messages, groqRequestOptions, onDelta) {
+  const usesWebSearch = groqRequestOptions.provider === 'groq-web-search';
+  const aiResponse = await fetchWithTimeout(openRouterChatCompletionsUrl, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${openRouterApiKey}`,
+      'Content-Type': 'application/json',
+      'HTTP-Referer': openRouterSiteUrl,
+      'X-Title': openRouterAppName,
+    },
+    body: JSON.stringify({
+      model: usesWebSearch ? openRouterWebSearchModel : openRouterModel,
+      messages,
+      temperature: usesWebSearch ? 0 : 0.2,
+      max_tokens: usesWebSearch ? Math.min(groqRequestOptions.maxTokens, 360) : openRouterMaxTokens,
+      stream: true,
+      ...(usesWebSearch
+        ? {
+            plugins: [
+              {
+                id: 'web',
+                max_results: 1,
+                search_prompt: 'Relevant current web result:',
+              },
+            ],
+          }
+        : {}),
+    }),
+  }, groqRequestOptions.timeoutMs);
+
+  if (!aiResponse.ok) {
+    const errorBody = await aiResponse.text();
+    const error = new Error(`HTTP ${aiResponse.status}: ${errorBody.slice(0, 500)}`);
+    error.status = aiResponse.status;
+    setProviderErrorDetails(error, errorBody);
+    throw error;
+  }
+
+  if (!aiResponse.body) throw new Error('OpenRouter did not return a response stream');
 
   const reader = aiResponse.body.getReader();
   const decoder = new TextDecoder();
@@ -397,12 +571,31 @@ async function retryGroqRequest(operation, options = {}) {
 
 function isRetryableGroqError(error) {
   const status = Number(error?.status || 0);
+  if (error?.code === 'rate_limit_exceeded' && /tokens per day|TPD|daily/i.test(error.message)) {
+    return false;
+  }
+
   return (
     error?.name === 'AbortError' ||
-    status === 429 ||
+    (status === 429 && error?.code !== 'rate_limit_exceeded') ||
     status >= 500 ||
     /\b(ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|fetch failed|timeout)\b/i.test(error?.message || '')
   );
+}
+
+function setGroqErrorDetails(error, errorBody) {
+  setProviderErrorDetails(error, errorBody);
+}
+
+function setProviderErrorDetails(error, errorBody) {
+  try {
+    const parsed = JSON.parse(errorBody);
+    error.code = parsed?.error?.code || '';
+    error.type = parsed?.error?.type || '';
+  } catch {
+    error.code = '';
+    error.type = '';
+  }
 }
 
 function wait(ms) {
@@ -556,30 +749,12 @@ Answer style:
 }
 
 function buildWebSearchSystemPrompt() {
-  return `
-You are the web-search assistant inside Md. Faizur Rahman Khan's portfolio chat.
-
-Current date: ${currentDateLabel}.
-
-For current events, latest news, weather, prices, sports, recent releases, wars, conflicts, public officeholders, government leaders, elections, company leadership, or world happenings:
-- You must use current web-search results before answering.
-- Answer only from current web results, not from model memory.
-- Mention the as-of date: ${currentDateLabel}.
-- For public officeholders or leaders, verify against recent official pages and/or multiple credible news results when available. Do not rely on old Wikipedia snippets if more recent sources conflict.
-- If the search results conflict, say they conflict and identify the most recent credible result instead of guessing.
-- If you cannot verify the answer from current search results, say you cannot verify it right now.
-- Do not invent source URLs, section URLs, or article URLs.
-- Only include source URLs when they are full https URLs from web results.
-- Keep the answer concise and useful.
-
-For live sports, fixtures, scores, match updates, or tournaments:
-- Prefer official competition pages, official team/league pages, ESPN, BBC Sport, Reuters, AP, The Athletic, Al Jazeera, FIFA, ICC, NBA, NFL, or similarly credible sports sources.
-- Do not use markdown tables. Use short bullets only.
-- Each bullet must describe one match only. Never combine two matches in one bullet.
-- Only state a score, scorer, kickoff time, venue, or result when it is explicitly visible in the current search result.
-- If the user asks for match updates and verified results are not available, say that you cannot verify live match results right now and provide verified fixture/status links instead.
-- For FIFA World Cup 2026 questions, do not invent fictional group matches, scorers, venues, or results. Use FIFA/ESPN/BBC/Reuters/AP-style result pages only.
-`;
+  return `Web-search assistant. Date: ${currentDateLabel}.
+Use current web results only, not memory.
+Answer in 2-5 concise bullets. No tables. No invented URLs.
+If sources conflict or are weak, say so briefly.
+For leaders/officeholders, prefer recent official or credible news sources.
+For sports, state scores/results only if explicitly verified.`;
 }
 
 function extractChatCompletionText(data) {
@@ -606,6 +781,27 @@ function extractGroqToolSources(data) {
       sources.push({ title, url });
       if (sources.length >= 5) return sources;
     }
+  }
+
+  return sources;
+}
+
+function extractOpenRouterSources(data) {
+  const annotations = data.choices?.[0]?.message?.annotations;
+  if (!Array.isArray(annotations)) return [];
+
+  const sources = [];
+  const seenUrls = new Set();
+
+  for (const annotation of annotations) {
+    const citation = annotation?.url_citation || {};
+    const url = String(citation.url || '').trim();
+    const title = String(citation.title || citation.url || '').trim();
+    if (!url || !title || !/^https?:\/\//i.test(url) || seenUrls.has(url)) continue;
+
+    seenUrls.add(url);
+    sources.push({ title, url });
+    if (sources.length >= 5) break;
   }
 
   return sources;
@@ -801,18 +997,19 @@ function getGroqRequestOptions(question) {
   const isSportsQuestion = needsWebSearch && isSportsCurrentQuestion(question);
   return {
     model: needsWebSearch ? groqWebSearchModel : groqModel,
-    maxTokens: needsWebSearch ? Math.max(groqMaxTokens, isSportsQuestion ? 700 : 850) : groqMaxTokens,
+    maxTokens: needsWebSearch ? (isSportsQuestion ? 420 : 360) : groqMaxTokens,
     provider: needsWebSearch ? 'groq-web-search' : 'groq',
-    timeoutMs: needsWebSearch ? 45_000 : 20_000,
+    timeoutMs: needsWebSearch ? 30_000 : 20_000,
     isSportsQuestion,
   };
 }
 
 function getContextMessages(messages, groqRequestOptions) {
+  if (groqRequestOptions.provider === 'groq-web-search') return [];
+
   return messages
     .filter((message) => message && ['user', 'assistant'].includes(message.role))
     .filter((message) => {
-      if (groqRequestOptions.provider === 'groq-web-search') return true;
       return !looksLikeWebSearchAnswer(message.content);
     })
     .map((message) => ({
@@ -824,23 +1021,11 @@ function getContextMessages(messages, groqRequestOptions) {
 function buildUserQuestion(question, groqRequestOptions) {
   if (groqRequestOptions.provider !== 'groq-web-search') return question;
 
-  const sportsInstruction = isSportsCurrentQuestion(question)
-    ? [
-        '',
-        'This is a live/current sports question.',
-        'Search specifically for official or reliable sports result pages. Use bullets, not tables.',
-        'Only include match updates with an explicitly verified date and score/status from current search results.',
-        'If no verified live scores/results are available, say that clearly and provide verified schedule/result source links instead.',
-      ].join('\n')
+  const suffix = isSportsCurrentQuestion(question)
+    ? ' Use reliable sports sources; no tables; verified scores only.'
     : '';
 
-  return [
-    `User question: ${question}`,
-    '',
-    'This is a current-world question. Search the web now and answer only from current, credible web results.',
-    `Use ${currentDateLabel} as the as-of date. If current search results are missing, weak, or conflicting, say so instead of relying on memory.`,
-    sportsInstruction,
-  ].join('\n');
+  return `Search current web results and answer briefly as of ${currentDateLabel}: ${question}${suffix}`;
 }
 
 function isSportsCurrentQuestion(question) {

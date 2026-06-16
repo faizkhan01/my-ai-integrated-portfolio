@@ -150,7 +150,7 @@ async function streamAssistantAnswerOnce(question, assistantMessage) {
     const data = await response.json().catch(() => ({}));
     const error = new Error(data.error || 'The assistant could not answer right now.');
     error.status = response.status;
-    error.retryable = response.status === 429 || response.status >= 500;
+    error.retryable = data.retryable === false ? false : response.status === 429 || response.status >= 500;
     if (/not configured/i.test(error.message)) error.retryable = false;
     throw error;
   }
@@ -181,7 +181,7 @@ async function streamAssistantAnswerOnce(question, assistantMessage) {
 
       if (event.type === 'error') {
         const error = new Error(event.error || 'The assistant could not answer right now.');
-        error.retryable = true;
+        error.retryable = event.retryable !== false;
         throw error;
       }
     }
