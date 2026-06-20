@@ -228,6 +228,7 @@ function cleanAssistantText(content) {
     .replace(/<\/?[^>]+>/g, '')
     .replace(/[【】]/g, '')
     .replace(/\*\*/g, '')
+    .replace(/(?:\[\d+\])+/g, '')
     .replace(/(^|\n)\*([^*\n]+)\*(?=\n|$)/g, '$1$2')
     .replace(/(^|[^\n])\*([^*\n]+)\*/g, '$1$2')
     .replace(/#{1,6}\s*/g, '')

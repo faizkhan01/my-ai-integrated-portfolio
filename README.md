@@ -10,7 +10,7 @@ Professional AI-integrated portfolio website for Md. Faizur Rahman Khan, a senio
 - CV-aware answers from verified profile context embedded in `server.mjs`.
 - Web-search mode for current-world questions using Groq Compound, with OpenRouter web fallback.
 - FIFA World Cup 2026 match-update fallback using ESPN's public scoreboard endpoint to avoid invented sports results.
-- Downloadable resume from `public/assets/md-faizur-rahman-khan-resume.pdf`.
+- Downloadable resume from `public/assets/Md. Faizur Rahman Khan Resume.pdf`.
 - Static assets served from `public/`, with the Node server handling `/api/chat`.
 
 ## Tech Stack
@@ -140,6 +140,6 @@ Render provides `PORT` automatically, and `server.mjs` already reads it.
 ## Notes
 
 - `.env`, `node_modules`, and `.DS_Store` are ignored by git.
-- The resume button downloads `public/assets/md-faizur-rahman-khan-resume.pdf`.
+- The resume button downloads `public/assets/Md. Faizur Rahman Khan Resume.pdf`.
 - The FK browser tab icon is served from `public/assets/fk-favicon.svg`.
 - Legacy OpenAI, DeepSeek, and OpenCode implementations are intentionally disabled in `server.mjs`.

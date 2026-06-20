@@ -30,7 +30,7 @@ const openRouterMaxTokens =
   Number.parseInt(process.env.OPENROUTER_MAX_TOKENS || '500', 10) || 500;
 const openRouterSiteUrl = process.env.OPENROUTER_SITE_URL || 'https://faizurrahman-portfolio.web.app';
 const openRouterAppName = process.env.OPENROUTER_APP_NAME || 'Md. Faizur Rahman Khan Portfolio';
-const resumeDownloadPath = '/assets/md-faizur-rahman-khan-resume.pdf';
+const resumeDownloadPath = '/assets/Md.%20Faizur%20Rahman%20Khan%20Resume.pdf';
 const currentDateLabel = getCurrentDateLabel();
 const currentDateIso = getCurrentDateIso();
 const groqRetryDelays = [700, 1400, 2600];
@@ -218,8 +218,28 @@ async function streamDynamicPortfolioAnswer(messages, response, groqRequestOptio
   });
 
   try {
+    if (groqRequestOptions.provider === 'groq-web-search') {
+      const result = await generateDynamicPortfolioAnswer(messages, groqRequestOptions);
+      await streamTextChunks(response, cleanDynamicAnswer(result.answer));
+      writeJsonLine(response, {
+        type: 'done',
+        provider: result.provider,
+      });
+      return;
+    }
+
     let hasContent = false;
     let streamProvider = groqRequestOptions.provider;
+    const streamSources = [];
+    const seenStreamSourceUrls = new Set();
+    const onSource = (source) => {
+      if (streamSources.length >= 5) return;
+      const [cleanSource] = dedupeSources([source]);
+      if (!cleanSource || seenStreamSourceUrls.has(cleanSource.url)) return;
+      seenStreamSourceUrls.add(cleanSource.url);
+      streamSources.push(cleanSource);
+    };
+
     try {
       if (!groqApiKey) throw new Error('Groq is not configured');
 
@@ -233,7 +253,7 @@ async function streamDynamicPortfolioAnswer(messages, response, groqRequestOptio
               type: 'chunk',
               delta,
             });
-          });
+          }, onSource);
         },
         {
           shouldRetry: (error) => !hasContent && isRetryableGroqError(error),
@@ -251,7 +271,7 @@ async function streamDynamicPortfolioAnswer(messages, response, groqRequestOptio
           type: 'chunk',
           delta,
         });
-      });
+      }, onSource);
       streamProvider =
         groqRequestOptions.provider === 'groq-web-search'
           ? 'openrouter-web-search'
@@ -259,6 +279,23 @@ async function streamDynamicPortfolioAnswer(messages, response, groqRequestOptio
     }
 
     if (!hasContent) throw new Error('AI provider returned an empty stream');
+
+    if (groqRequestOptions.provider === 'groq-web-search') {
+      if (!streamSources.length) {
+        const fallbackSources = await fetchOpenRouterWebSources(messages, groqRequestOptions).catch((error) => {
+          console.error('[web-source-fallback]', error.message);
+          return [];
+        });
+        fallbackSources.forEach(onSource);
+      }
+
+      if (streamSources.length) {
+        writeJsonLine(response, {
+          type: 'chunk',
+          delta: `\n\n${formatVerifiedSources(streamSources)}`,
+        });
+      }
+    }
 
     writeJsonLine(response, {
       type: 'done',
@@ -313,10 +350,30 @@ function sendStreamedStaticAnswer(response, answer, provider) {
   response.end();
 }
 
+async function streamTextChunks(response, text) {
+  const chunks = String(text || '').match(/.{1,36}(\s|$)|\S+/g) || [];
+
+  for (const chunk of chunks) {
+    writeJsonLine(response, {
+      type: 'chunk',
+      delta: chunk,
+    });
+    await wait(12);
+  }
+}
+
 async function generateDynamicPortfolioAnswer(messages, groqRequestOptions) {
   const aiResult = await generateAiAnswerWithFallback(messages, groqRequestOptions);
 
-  if (groqRequestOptions.provider === 'groq-web-search' && !aiResult.sources.length) {
+  const relatedSources =
+    groqRequestOptions.provider === 'groq-web-search'
+      ? dedupeSources([
+          ...aiResult.sources,
+          ...(aiResult.sources.length ? [] : await fetchRelatedWebSources(getLastUserMessage(messages))),
+        ]).slice(0, 5)
+      : aiResult.sources;
+
+  if (groqRequestOptions.provider === 'groq-web-search' && !relatedSources.length) {
     return {
       answer: buildUnverifiedCurrentInfoAnswer(groqRequestOptions),
       provider: aiResult.provider,
@@ -325,7 +382,7 @@ async function generateDynamicPortfolioAnswer(messages, groqRequestOptions) {
 
   const answer =
     groqRequestOptions.provider === 'groq-web-search'
-      ? appendVerifiedWebSources(aiResult.answer, aiResult.sources)
+      ? appendVerifiedWebSources(aiResult.answer, relatedSources)
       : aiResult.answer;
 
   if (answer) {
@@ -444,7 +501,86 @@ async function callOpenRouter(messages, groqRequestOptions) {
   };
 }
 
-async function streamGroq(messages, groqRequestOptions, onDelta) {
+async function fetchOpenRouterWebSources(messages, groqRequestOptions) {
+  if (!openRouterApiKey || groqRequestOptions.provider !== 'groq-web-search') return [];
+
+  const aiResponse = await fetchWithTimeout(openRouterChatCompletionsUrl, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${openRouterApiKey}`,
+      'Content-Type': 'application/json',
+      'HTTP-Referer': openRouterSiteUrl,
+      'X-Title': openRouterAppName,
+    },
+    body: JSON.stringify({
+      model: openRouterWebSearchModel,
+      messages: [
+        {
+          role: 'system',
+          content: `Find current, relevant web sources only. Date: ${currentDateLabel}. Return 3-5 markdown links only.`,
+        },
+        {
+          role: 'user',
+          content: `Find related sources for: ${getLastUserMessage(messages)}`,
+        },
+      ],
+      temperature: 0,
+      max_tokens: 220,
+      stream: false,
+      plugins: [
+        {
+          id: 'web',
+          max_results: 5,
+          search_prompt: 'Relevant current source:',
+        },
+      ],
+    }),
+  }, 18_000);
+
+  if (!aiResponse.ok) {
+    const errorBody = await aiResponse.text();
+    const error = new Error(`HTTP ${aiResponse.status}: ${errorBody.slice(0, 500)}`);
+    error.status = aiResponse.status;
+    setProviderErrorDetails(error, errorBody);
+    throw error;
+  }
+
+  const data = await aiResponse.json();
+  return dedupeSources([
+    ...extractOpenRouterSources(data),
+    ...extractSourcesFromText(extractChatCompletionText(data)),
+  ]).slice(0, 5);
+}
+
+async function fetchRelatedWebSources(question) {
+  const query = String(question || '')
+    .replace(/^Search current web results and answer briefly as of [^:]+:\s*/i, '')
+    .slice(0, 180)
+    .trim();
+  if (!query) return [];
+
+  const rssUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-US&gl=US&ceid=US:en`;
+  const response = await fetchWithTimeout(rssUrl, {
+    headers: {
+      Accept: 'application/rss+xml, application/xml, text/xml',
+      'User-Agent': 'faizur-portfolio/1.0',
+    },
+  }, 10_000);
+
+  if (!response.ok) return [];
+
+  const xml = await response.text();
+  const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, 5);
+
+  return dedupeSources(
+    items.map(([, item]) => ({
+      title: extractXmlTag(item, 'title'),
+      url: extractXmlTag(item, 'link'),
+    })),
+  ).slice(0, 5);
+}
+
+async function streamGroq(messages, groqRequestOptions, onDelta, onSource) {
   const aiResponse = await fetchWithTimeout(groqChatCompletionsUrl, {
     method: 'POST',
     headers: {
@@ -483,14 +619,14 @@ async function streamGroq(messages, groqRequestOptions, onDelta) {
     buffer = events.pop() || '';
 
     for (const event of events) {
-      if (processGroqStreamEvent(event, onDelta)) return;
+      if (processGroqStreamEvent(event, onDelta, onSource)) return;
     }
   }
 
-  if (buffer) processGroqStreamEvent(buffer, onDelta);
+  if (buffer) processGroqStreamEvent(buffer, onDelta, onSource);
 }
 
-async function streamOpenRouter(messages, groqRequestOptions, onDelta) {
+async function streamOpenRouter(messages, groqRequestOptions, onDelta, onSource) {
   const usesWebSearch = groqRequestOptions.provider === 'groq-web-search';
   const aiResponse = await fetchWithTimeout(openRouterChatCompletionsUrl, {
     method: 'POST',
@@ -543,11 +679,11 @@ async function streamOpenRouter(messages, groqRequestOptions, onDelta) {
     buffer = events.pop() || '';
 
     for (const event of events) {
-      if (processGroqStreamEvent(event, onDelta)) return;
+      if (processGroqStreamEvent(event, onDelta, onSource)) return;
     }
   }
 
-  if (buffer) processGroqStreamEvent(buffer, onDelta);
+  if (buffer) processGroqStreamEvent(buffer, onDelta, onSource);
 }
 
 async function retryGroqRequest(operation, options = {}) {
@@ -807,6 +943,85 @@ function extractOpenRouterSources(data) {
   return sources;
 }
 
+function extractSourcesFromText(text) {
+  const sources = [];
+  const markdownLinkPattern = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g;
+  const rawUrlPattern = /(https?:\/\/[^\s)]+)/g;
+  let match;
+
+  while ((match = markdownLinkPattern.exec(text)) !== null) {
+    sources.push({
+      title: cleanSourceTitle(match[1]),
+      url: cleanSourceUrl(match[2]),
+    });
+  }
+
+  while ((match = rawUrlPattern.exec(text)) !== null) {
+    const url = cleanSourceUrl(match[1]);
+    if (sources.some((source) => source.url === url)) continue;
+    sources.push({
+      title: urlToSourceTitle(url),
+      url,
+    });
+  }
+
+  return sources.filter((source) => source.title && /^https?:\/\//i.test(source.url));
+}
+
+function dedupeSources(sources) {
+  const seenUrls = new Set();
+  const uniqueSources = [];
+
+  for (const source of sources) {
+    const url = cleanSourceUrl(source?.url || '');
+    const title = cleanSourceTitle(source?.title || urlToSourceTitle(url));
+    if (!url || !title || seenUrls.has(url) || !/^https?:\/\//i.test(url)) continue;
+
+    seenUrls.add(url);
+    uniqueSources.push({ title, url });
+  }
+
+  return uniqueSources;
+}
+
+function cleanSourceTitle(value) {
+  return String(value || '')
+    .replace(/\s+/g, ' ')
+    .replace(/^[-*•\d.)\s]+/, '')
+    .trim();
+}
+
+function cleanSourceUrl(value) {
+  return String(value || '')
+    .replace(/[),.;\]]+$/g, '')
+    .trim();
+}
+
+function urlToSourceTitle(url) {
+  try {
+    const hostname = new URL(url).hostname.replace(/^www\./, '');
+    return hostname;
+  } catch {
+    return url;
+  }
+}
+
+function decodeXmlText(value) {
+  return String(value || '')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .trim();
+}
+
+function extractXmlTag(xml, tagName) {
+  const pattern = new RegExp(`<${tagName}><!\\[CDATA\\[([\\s\\S]*?)\\]\\]><\\/${tagName}>|<${tagName}>([\\s\\S]*?)<\\/${tagName}>`);
+  const match = String(xml || '').match(pattern);
+  return decodeXmlText(match?.[1] || match?.[2] || '');
+}
+
 function cleanDynamicAnswer(answer) {
   return String(answer || '')
     .replace(/【(https?:\/\/[^】]+)】/g, '$1')
@@ -818,8 +1033,12 @@ function appendVerifiedWebSources(answer, sources) {
   const cleanedAnswer = removeInlineUrls(removeUnverifiedSourceHints(answer));
   if (!sources.length) return cleanedAnswer;
 
+  return [cleanedAnswer, '', formatVerifiedSources(sources)].join('\n');
+}
+
+function formatVerifiedSources(sources) {
   const verifiedSources = sources.map((source) => `- [${source.title}](${source.url})`).join('\n');
-  return [cleanedAnswer, '', 'Verified sources:', verifiedSources].join('\n');
+  return ['Verified sources:', verifiedSources].join('\n');
 }
 
 function buildUnverifiedCurrentInfoAnswer(groqRequestOptions = {}) {
@@ -1028,6 +1247,11 @@ function buildUserQuestion(question, groqRequestOptions) {
   return `Search current web results and answer briefly as of ${currentDateLabel}: ${question}${suffix}`;
 }
 
+function getLastUserMessage(messages) {
+  const userMessage = [...messages].reverse().find((message) => message?.role === 'user');
+  return String(userMessage?.content || '').slice(0, 500);
+}
+
 function isSportsCurrentQuestion(question) {
   const normalizedQuestion = normalizeQuestion(question);
   const sportsTerms =
@@ -1157,7 +1381,7 @@ function looksLikeWebSearchAnswer(content) {
   );
 }
 
-function processGroqStreamEvent(event, onDelta) {
+function processGroqStreamEvent(event, onDelta, onSource) {
   const dataLines = event
     .split(/\r?\n/)
     .filter((line) => line.startsWith('data:'))
@@ -1168,11 +1392,50 @@ function processGroqStreamEvent(event, onDelta) {
     if (dataLine === '[DONE]') return true;
 
     const payload = JSON.parse(dataLine);
+    extractStreamSources(payload).forEach((source) => onSource?.(source));
     const delta = payload.choices?.[0]?.delta?.content || '';
     if (delta) onDelta(delta);
   }
 
   return false;
+}
+
+function extractStreamSources(payload) {
+  const annotations = [
+    ...(payload.choices?.[0]?.message?.annotations || []),
+    ...(payload.choices?.[0]?.delta?.annotations || []),
+    ...(payload.message?.annotations || []),
+    ...(payload.annotations || []),
+  ];
+
+  const sources = annotations
+    .map((annotation) => {
+      const citation = annotation?.url_citation || annotation?.citation || annotation || {};
+      const url = String(citation.url || citation.href || '').trim();
+      const title = String(citation.title || citation.url || citation.href || '').trim();
+      if (!url || !title || !/^https?:\/\//i.test(url)) return null;
+      return { title, url };
+    })
+    .filter(Boolean);
+
+  const citations = [
+    ...(payload.choices?.[0]?.message?.citations || []),
+    ...(payload.choices?.[0]?.delta?.citations || []),
+    ...(payload.citations || []),
+  ];
+
+  for (const citation of citations) {
+    if (typeof citation === 'string' && /^https?:\/\//i.test(citation)) {
+      sources.push({ title: citation, url: citation });
+      continue;
+    }
+
+    const url = String(citation?.url || citation?.href || '').trim();
+    const title = String(citation?.title || citation?.url || citation?.href || '').trim();
+    if (url && title && /^https?:\/\//i.test(url)) sources.push({ title, url });
+  }
+
+  return sources;
 }
 
 function writeJsonLine(response, payload) {
